@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Snapshot Visualiser</title>
+
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #0f1117;
+        color: #e2e8f0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 16px;
+        background: #1a1d27;
+        border-bottom: 1px solid #2d3148;
+      }
+
+      header h1 {
+        font-size: 13px;
+        font-weight: 600;
+        color: #a78bfa;
+      }
+
+      .workspace {
+        flex: 1;
+        display: flex;
+        overflow: hidden;
+      }
+
+      #left {
+        display: flex;
+        flex-direction: column;
+        width: 360px;
+        border-right: 1px solid #2d3148;
+      }
+
+      .left-header {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 12px;
+        background: #1a1d27;
+        border-bottom: 1px solid #2d3148;
+      }
+
+      textarea {
+        flex: 1;
+        background: #0f1117;
+        color: #cbd5e1;
+        border: none;
+        border-bottom: 1px solid #2d3148;
+        padding: 12px;
+        font-family: monospace;
+        font-size: 12px;
+        resize: none;
+        outline: none;
+      }
+
+      .left-footer {
+        padding: 10px;
+        background: #1a1d27;
+        display: flex;
+        gap: 10px;
+      }
+
+      #render-btn {
+        flex: 1;
+        padding: 8px;
+        background: #a78bfa;
+        border: none;
+        border-radius: 5px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      #right {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+      }
+
+      iframe {
+        flex: 1;
+        border: none;
+      }
+
+      #statusbar {
+        padding: 6px 12px;
+        background: #1a1d27;
+        border-top: 1px solid #2d3148;
+        font-size: 11px;
+        color: #94a3b8;
+      }
+    </style>
+  </head>
+
+  <body>
+    <header>
+      <h1>Snapshot Visualiser</h1>
+    </header>
+
+    <div class="workspace">
+      <div id="left">
+        <div class="left-header">
+          <span>Snapshot JSON</span>
+        </div>
+
+        <textarea
+          id="input"
+          placeholder="Paste snapshot JSON here..."
+        ></textarea>
+
+        <div class="left-footer">
+          <button id="render-btn">Render</button>
+        </div>
+      </div>
+
+      <div id="right">
+        <iframe id="frame" sandbox="allow-same-origin allow-scripts"></iframe>
+        <div id="statusbar">Paste snapshot JSON and click Render</div>
+      </div>
+    </div>
+
+    <script>
+      const NodeType = {
+        Document: 0,
+        DocumentType: 1,
+        Element: 2,
+        Text: 3,
+        CDATA: 4,
+        Comment: 5,
+      };
+
+      function buildNode(n, doc) {
+        switch (n.type) {
+          case NodeType.Document:
+            return doc;
+
+          case NodeType.DocumentType:
+            return doc.implementation.createDocumentType(
+              n.name,
+              n.publicId,
+              n.systemId,
+            );
+
+          case NodeType.Element: {
+            let node;
+
+            if (n.tagName === "link" && n.attributes?._cssText) {
+              node = doc.createElement("style");
+              node.textContent = n.attributes._cssText;
+            } else if (n.tagName === "style" && n.attributes?._cssText) {
+              node = doc.createElement("style");
+              node.textContent = n.attributes._cssText;
+            } else {
+              node = doc.createElement(n.tagName);
+            }
+
+            for (const name in n.attributes || {}) {
+              if (name === "_cssText") continue;
+              if (name === "rr_dataURL") continue;
+
+              node.setAttribute(name, n.attributes[name]);
+            }
+
+            if (n.tagName === "input" || n.tagName === "textarea") {
+              if (n.attributes?.value !== undefined) {
+                node.value = n.attributes.value;
+              }
+            }
+
+            if (n.tagName === "input" && n.attributes?.checked) {
+              node.checked = true;
+            }
+
+            if (n.tagName === "select" && n.attributes?.value) {
+              node.value = n.attributes.value;
+            }
+
+            if (n.tagName === "canvas" && n.attributes?.rr_dataURL) {
+              const img = new Image();
+              img.onload = function () {
+                const ctx = node.getContext("2d");
+                ctx.drawImage(img, 0, 0);
+              };
+              img.src = n.attributes.rr_dataURL;
+            }
+
+            return node;
+          }
+
+          case NodeType.Text:
+            return doc.createTextNode(n.textContent);
+
+          case NodeType.CDATA:
+            return doc.createCDATASection(n.textContent);
+
+          case NodeType.Comment:
+            return doc.createComment(n.textContent);
+
+          default:
+            return null;
+        }
+      }
+
+      function rebuild(n, doc) {
+        const root = buildNode(n, doc);
+        if (!root) return null;
+
+        if (n.type === NodeType.Element) {
+          for (const child of n.childNodes || []) {
+            const childNode = rebuild(child, doc);
+
+            if (childNode) {
+              root.appendChild(childNode);
+            }
+          }
+        }
+
+        return root;
+      }
+
+      function countNodes(n) {
+        let c = 1;
+        for (const child of n.childNodes || []) {
+          c += countNodes(child);
+        }
+        return c;
+      }
+
+      function appendChildren(snapshotNode, target, doc) {
+        if (!snapshotNode) return;
+
+        for (const child of snapshotNode.childNodes || []) {
+          const node = rebuild(child, doc);
+
+          if (node) {
+            target.appendChild(node);
+          }
+        }
+      }
+
+      function render(data) {
+        const frame = document.getElementById("frame");
+        const doc = frame.contentDocument;
+
+        doc.open();
+        doc.write("<!DOCTYPE html><html><head></head><body></body></html>");
+        doc.close();
+
+        for (const [k, v] of Object.entries(data.attributes || {})) {
+          doc.documentElement.setAttribute(k, v);
+        }
+
+        const headSnap = data.childNodes?.find((n) => n.tagName === "head");
+        const bodySnap = data.childNodes?.find((n) => n.tagName === "body");
+
+        appendChildren(headSnap, doc.head, doc);
+
+        if (bodySnap) {
+          for (const [k, v] of Object.entries(bodySnap.attributes || {})) {
+            doc.body.setAttribute(k, v);
+          }
+
+          appendChildren(bodySnap, doc.body, doc);
+        }
+
+        const total = countNodes(data);
+
+        document.getElementById("statusbar").textContent =
+          "Rendered " + total + " nodes";
+      }
+
+      document.getElementById("render-btn").onclick = function () {
+        const input = document.getElementById("input").value.trim();
+
+        let data;
+
+        try {
+          data = JSON.parse(input);
+        } catch (e) {
+          alert("Invalid JSON");
+          return;
+        }
+
+        render(data);
+      };
+    </script>
+  </body>
+</html>
