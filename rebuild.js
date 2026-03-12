@@ -1,3 +1,7 @@
+// Deprecated — the replayer now uses morphdom directly against HTML strings.
+// The custom JSON snapshot format and manual rebuild are no longer needed.
+// Kept for reference only.
+
 const NodeType = {
   Document: 0,
   DocumentType: 1,

@@ -5,6 +5,7 @@ const EventType = {
   Load: 1,
   FullSnapshot: 2,
   IncrementalSnapshot: 3,
+  Meta: 4,           // URL / navigation change
 };
 
 const IncrementalSource = {
@@ -27,42 +28,24 @@ const MouseInteractions = {
   TouchEnd: 8,
 };
 
-// ─── Utils (utils.ts) ────────────────────────────────────────────────────────
-
-// mirror maps serialised node IDs ↔ live DOM nodes.
-// Nodes must be tagged with .__sn = { id } during snapshot for getId to work.
-const mirror = {
-  map: {},
-  getId(n) {
-    return n.__sn && n.__sn.id;
-  },
-  getNode(id) {
-    return mirror.map[id];
-  },
-};
+// ─── Utils ───────────────────────────────────────────────────────────────────
 
 function on(type, fn, target = document) {
   target.addEventListener(type, fn, { capture: true, passive: true });
   return () => target.removeEventListener(type, fn);
 }
 
-// Throttle — adapted from Underscore.js (same as rrweb's utils.ts)
 function throttle(func, wait, options = {}) {
   let timeout = null;
   let previous = 0;
   return function () {
     const now = Date.now();
-    if (!previous && options.leading === false) {
-      previous = now;
-    }
+    if (!previous && options.leading === false) previous = now;
     const remaining = wait - (now - previous);
     const context = this;
     const args = arguments;
     if (remaining <= 0 || remaining > wait) {
-      if (timeout) {
-        clearTimeout(timeout);
-        timeout = null;
-      }
+      if (timeout) { clearTimeout(timeout); timeout = null; }
       previous = now;
       func.apply(context, args);
     } else if (!timeout && options.trailing !== false) {
@@ -75,77 +58,20 @@ function throttle(func, wait, options = {}) {
   };
 }
 
-// ─── Observers (observer.ts) ─────────────────────────────────────────────────
+// ─── Observers ───────────────────────────────────────────────────────────────
 
+// After each mutation batch, re-capture body HTML and emit it.
+// morphdom on the replay side will diff and patch the iframe body.
 function initMutationObserver(cb) {
-  const observer = new MutationObserver(mutations => {
-    const texts = [];
-    const attributes = [];
-    const removes = [];
-    const adds = [];
-
-    mutations.forEach(mutation => {
-      const {
-        type,
-        target,
-        oldValue,
-        addedNodes,
-        removedNodes,
-        attributeName,
-        nextSibling,
-        previousSibling,
-      } = mutation;
-
-      const id = mirror.getId(target);
-
-      switch (type) {
-        case 'characterData': {
-          const value = target.textContent;
-          if (value !== oldValue) {
-            texts.push({ id, value });
-          }
-          break;
-        }
-        case 'attributes': {
-          const value = target.getAttribute(attributeName);
-          if (value === oldValue) return;
-          let item = attributes.find(a => a.id === id);
-          if (!item) {
-            item = { id, attributes: {} };
-            attributes.push(item);
-          }
-          item.attributes[attributeName] = value;
-          break;
-        }
-        case 'childList': {
-          removedNodes.forEach(n => {
-            removes.push({ parentId: id, id: mirror.getId(n) });
-          });
-          addedNodes.forEach(n => {
-            adds.push({
-              parentId: id,
-              previousId: previousSibling ? mirror.getId(previousSibling) : null,
-              nextId: nextSibling ? mirror.getId(nextSibling) : null,
-              id: mirror.getId(n),
-            });
-          });
-          break;
-        }
-      }
-    });
-
-    cb({ texts, attributes, removes, adds });
+  const observer = new MutationObserver(() => {
+    cb({ html: captureBodyHtml() });
   });
-
-  observer.observe(document, {
+  observer.observe(document.body, {
     attributes: true,
-    attributeOldValue: true,
     characterData: true,
-    characterDataOldValue: true,
     childList: true,
     subtree: true,
   });
-
   return observer;
 }
 
@@ -155,93 +81,91 @@ function initMousemoveObserver(cb) {
 
   const wrappedCb = throttle(() => {
     const totalOffset = Date.now() - timeBaseline;
-    cb(
-      positions.map(p => {
-        p.timeOffset -= totalOffset;
-        return p;
-      }),
-    );
+    cb(positions.map(p => { p.timeOffset -= totalOffset; return p; }));
     positions = [];
     timeBaseline = null;
   }, 500);
 
-  const updatePosition = throttle(
-    evt => {
-      const { clientX, clientY } = evt;
-      if (!timeBaseline) {
-        timeBaseline = Date.now();
-      }
-      positions.push({ x: clientX, y: clientY, timeOffset: Date.now() - timeBaseline });
-      wrappedCb();
-    },
-    20,
-    { trailing: false },
-  );
+  const updatePosition = throttle(evt => {
+    const { clientX, clientY } = evt;
+    if (!timeBaseline) timeBaseline = Date.now();
+    positions.push({ x: clientX, y: clientY, timeOffset: Date.now() - timeBaseline });
+    wrappedCb();
+  }, 20, { trailing: false });
 
   return on('mousemove', updatePosition);
 }
 
 function initMouseInteractionObserver(cb) {
   const handlers = [];
-
-  const getHandler = eventKey => {
-    return evt => {
-      const id = mirror.getId(evt.target);
-      const { clientX, clientY } = evt;
-      cb({ type: MouseInteractions[eventKey], id, x: clientX, y: clientY });
-    };
+  const getHandler = eventKey => evt => {
+    const { clientX, clientY } = evt;
+    cb({ type: MouseInteractions[eventKey], x: clientX, y: clientY });
   };
-
   Object.keys(MouseInteractions)
     .filter(key => isNaN(Number(key)))
-    .forEach(eventKey => {
-      const eventName = eventKey.toLowerCase();
-      handlers.push(on(eventName, getHandler(eventKey)));
-    });
-
+    .forEach(eventKey => handlers.push(on(eventKey.toLowerCase(), getHandler(eventKey))));
   return () => handlers.forEach(h => h());
 }
 
+// Scroll — identifies target by CSS selector instead of mirror ID
 function initScrollObserver(cb) {
   const updatePosition = throttle(evt => {
     if (!evt.target) return;
-    const id = mirror.getId(evt.target);
-    if (evt.target === document) {
-      cb({ id, x: document.documentElement.scrollLeft, y: document.documentElement.scrollTop });
-    } else {
-      cb({ id, x: evt.target.scrollLeft, y: evt.target.scrollTop });
-    }
+    const t = evt.target;
+    const selector = (t === document || t === document.documentElement)
+      ? 'html'
+      : (t.id ? '#' + CSS.escape(t.id) : getCssSelector(t));
+    cb({
+      selector,
+      x: t.scrollLeft ?? (t === document ? document.documentElement.scrollLeft : 0),
+      y: t.scrollTop  ?? (t === document ? document.documentElement.scrollTop  : 0),
+    });
   }, 100);
-
   return on('scroll', updatePosition);
 }
 
 function initViewportResizeObserver(cb) {
   const updateDimension = throttle(() => {
-    const height =
-      window.innerHeight ||
-      (document.documentElement && document.documentElement.clientHeight) ||
-      (document.body && document.body.clientHeight);
-    const width =
-      window.innerWidth ||
-      (document.documentElement && document.documentElement.clientWidth) ||
-      (document.body && document.body.clientWidth);
+    const height = window.innerHeight || document.documentElement?.clientHeight || document.body?.clientHeight;
+    const width  = window.innerWidth  || document.documentElement?.clientWidth  || document.body?.clientWidth;
     cb({ width: Number(width), height: Number(height) });
   }, 200);
-
   return on('resize', updateDimension, window);
 }
 
-function initObservers(o) {
-  const mutationObserver = initMutationObserver(o.mutationCb);
-  const mousemoveHandler = initMousemoveObserver(o.mousemoveCb);
-  const mouseInteractionHandler = initMouseInteractionObserver(o.mouseInteractionCb);
-  const scrollHandler = initScrollObserver(o.scrollCb);
-  const viewportResizeHandler = initViewportResizeObserver(o.viewportResizeCb);
-  return { mutationObserver, mousemoveHandler, mouseInteractionHandler, scrollHandler, viewportResizeHandler };
+// Navigation — monkey-patches history API + popstate/hashchange.
+// pushState/replaceState don't fire any native event so they must be wrapped.
+function initNavigationObserver(cb) {
+  const origPush    = history.pushState.bind(history);
+  const origReplace = history.replaceState.bind(history);
+
+  history.pushState = (...args) => { origPush(...args);    cb({ href: window.location.href }); };
+  history.replaceState = (...args) => { origReplace(...args); cb({ href: window.location.href }); };
+
+  const onNavEvent = () => cb({ href: window.location.href });
+  const offPop  = on('popstate',   onNavEvent, window);
+  const offHash = on('hashchange', onNavEvent, window);
+
+  return () => {
+    history.pushState    = origPush;
+    history.replaceState = origReplace;
+    offPop();
+    offHash();
+  };
 }
 
-// ─── Record (record/index.ts) ────────────────────────────────────────────────
+function initObservers(o) {
+  const mutationObserver        = initMutationObserver(o.mutationCb);
+  const mousemoveHandler        = initMousemoveObserver(o.mousemoveCb);
+  const mouseInteractionHandler = initMouseInteractionObserver(o.mouseInteractionCb);
+  const scrollHandler           = initScrollObserver(o.scrollCb);
+  const viewportResizeHandler   = initViewportResizeObserver(o.viewportResizeCb);
+  const navigationHandler       = initNavigationObserver(o.navigationCb);
+  return { mutationObserver, mousemoveHandler, mouseInteractionHandler, scrollHandler, viewportResizeHandler, navigationHandler };
+}
+
+// ─── Record ──────────────────────────────────────────────────────────────────
 
 function wrapEvent(e) {
   return { ...e, timestamp: Date.now() };
@@ -251,11 +175,14 @@ function wrapEvent(e) {
  * record({ emit })
  *
  * Starts recording DOM events and emitting them via the provided emit callback.
- * Each emitted event has a `type`, `data`, and `timestamp`.
  *
- * Depends on snapshot.js being available as `snapshot` in scope.
- * Also requires that snapshot() tags each live DOM node with .__sn = { id }
- * so that mirror.getId() can resolve node IDs during incremental recording.
+ * Full snapshot event:    { type: 2, data: { html }, timestamp }
+ * Mutation event:         { type: 3, data: { source: 0, html }, timestamp }
+ *   html = body.outerHTML after each mutation batch — replayer uses morphdom to patch
+ * Scroll event:           { type: 3, data: { source: 3, selector, x, y }, timestamp }
+ * Mouse/Resize events:    unchanged — coordinate-based, no node references needed
+ *
+ * Depends on captureHtml, captureBodyHtml, getCssSelector from snapshot.js being in scope.
  */
 function record(options) {
   const { emit } = options;
@@ -265,16 +192,18 @@ function record(options) {
     emit(wrapEvent({ type: EventType.DomContentLoaded, data: { href: window.location.href } }));
   });
 
+  // Hard navigation — JS context will be destroyed after this fires
+  on('beforeunload', () => {
+    emit(wrapEvent({ type: EventType.Meta, data: { href: window.location.href, unloading: true } }));
+  }, window);
+
   on('load', () => {
     emit(wrapEvent({ type: EventType.Load, data: {} }));
 
-    const node = snapshot(document);
-    if (!node) {
-      console.warn('Failed to snapshot the document');
-      return;
-    }
+    const html = captureHtml();
+    if (!html) { console.warn('captureHtml returned empty'); return; }
 
-    emit(wrapEvent({ type: EventType.FullSnapshot, data: { node } }));
+    emit(wrapEvent({ type: EventType.FullSnapshot, data: { html } }));
 
     initObservers({
       mutationCb: m =>
@@ -287,9 +216,11 @@ function record(options) {
         emit(wrapEvent({ type: EventType.IncrementalSnapshot, data: { source: IncrementalSource.Scroll, ...p } })),
       viewportResizeCb: d =>
         emit(wrapEvent({ type: EventType.IncrementalSnapshot, data: { source: IncrementalSource.ViewportResize, ...d } })),
+      navigationCb: d =>
+        emit(wrapEvent({ type: EventType.Meta, data: d })),
     });
   }, window);
 }
 
-export { EventType, IncrementalSource, MouseInteractions, mirror };
+export { EventType, IncrementalSource, MouseInteractions };
 export default record;
